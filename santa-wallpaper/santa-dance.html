@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dancing Santa Sketch</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f4efe4; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #help {
+    position: fixed; left: 16px; bottom: 16px; max-width: 360px;
+    font: 13px/1.5 system-ui, sans-serif; color: #222; background: rgba(255,255,255,.92);
+    padding: 12px 14px; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,.2); display: none;
+  }
+  #help kbd { background: #eee; border-radius: 3px; padding: 0 4px; font-family: inherit; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="help">
+  <b>Dancing Santa Sketch</b><br>
+  <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> switch style (pencil, ink and marker, chalkboard)<br>
+  <kbd>+</kbd> / <kbd>-</kbd> change tempo &nbsp;·&nbsp; <kbd>T</kbd> tap along with your music to set the tempo<br>
+  <kbd>S</kbd> toggle snow &nbsp;·&nbsp; <kbd>H</kbd> hide this help<br>
+  <span id="bpmlabel"></span>
+</div>
+<script>
+(() => {
+  // ---------- settings (URL: ?style=pencil|ink|chalk&bpm=120&snow=1) ----------
+  const params = new URLSearchParams(location.search);
+  const STYLE_NAMES = ['pencil', 'ink', 'chalk'];
+  let styleName = STYLE_NAMES.includes(params.get('style')) ? params.get('style') : 'pencil';
+  let bpm = Math.min(200, Math.max(60, parseFloat(params.get('bpm')) || 120));
+  let snowOverride = params.has('snow') ? params.get('snow') !== '0' : null;
+  const EXPORT = params.get('export') === '1';
+  const FPS = 12;            // drawn "on twos", like hand animation
+  const BEATS_PER_LOOP = 32; // 4 moves x 8 beats
+
+  const STYLES = {
+    pencil: {
+      bg: '#f4efe4', grain: 'rgba(80,60,40,0.05)', vignette: 'rgba(90,70,40,0.18)',
+      line: '#3b3632', lineW: 2.1, lineAlpha: 0.85, jitter: 1.7, passes: 2,
+      fill: 'hatch', blend: 'multiply',
+      colors: { red: '#c9473d', white: null, skin: '#dca88c', black: '#3b3632', gold: '#c3962c', green: '#5f8a55', shadow: '#6d655c' },
+      hatchGap: 5.5, snow: false,
+    },
+    ink: {
+      bg: '#fbfaf6', grain: 'rgba(0,0,0,0.035)', vignette: 'rgba(0,0,0,0.08)',
+      line: '#1c1a19', lineW: 3.0, lineAlpha: 0.95, jitter: 1.2, passes: 1,
+      fill: 'marker', blend: 'multiply',
+      colors: { red: '#e5372e', white: '#ecebe6', skin: '#f6c6a8', black: '#2a2726', gold: '#f2b62d', green: '#3fa35b', shadow: '#cfcac0' },
+      hatchGap: 6, snow: false,
+    },
+    chalk: {
+      bg: '#26332d', grain: 'rgba(255,255,255,0.035)', vignette: 'rgba(0,0,0,0.35)',
+      line: '#f1efe7', lineW: 2.4, lineAlpha: 0.85, jitter: 2.0, passes: 2,
+      fill: 'hatch', blend: 'source-over',
+      colors: { red: '#ef6f66', white: '#f1efe7', skin: '#f0c7ab', black: null, gold: '#f3d36e', green: '#9fd89a', shadow: '#f1efe7' },
+      hatchGap: 6.5, snow: true,
+    },
+  };
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, DPR = 1, paper = null;
+
+  // ---------- helpers ----------
+  const lerp = (a, b, x) => a + (b - a) * x;
+  const smooth = x => x * x * (3 - 2 * x);
+  const clamp01 = x => Math.max(0, Math.min(1, x));
+  const hash = n => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+  const rot = (p, a) => ({ x: p.x * Math.cos(a) - p.y * Math.sin(a), y: p.x * Math.sin(a) + p.y * Math.cos(a) });
+  const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y });
+  const scl = (a, k) => ({ x: a.x * k, y: a.y * k });
+
+  let boil = 0, strokeId = 0;
+  const jit = (i, amp) => (hash(strokeId * 17.13 + i * 3.71 + boil * 91.7) - 0.5) * 2 * amp;
+
+  function ellipsePts(cx, cy, rx, ry, a = 0, n = 22) {
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const t = (i / n) * Math.PI * 2;
+      const p = rot({ x: Math.cos(t) * rx, y: Math.sin(t) * ry }, a);
+      pts.push({ x: cx + p.x, y: cy + p.y });
+    }
+    return pts;
+  }
+  function capsulePts(a, b, r, n = 8) {
+    const ang = Math.atan2(b.y - a.y, b.x - a.x), pts = [];
+    for (let i = 0; i <= n; i++) { const t = ang - Math.PI / 2 + (i / n) * Math.PI; pts.push({ x: b.x + Math.cos(t) * r, y: b.y + Math.sin(t) * r }); }
+    for (let i = 0; i <= n; i++) { const t = ang + Math.PI / 2 + (i / n) * Math.PI; pts.push({ x: a.x + Math.cos(t) * r, y: a.y + Math.sin(t) * r }); }
+    return pts;
+  }
+  // one smooth "sausage" outline through shoulder/elbow/hand (or hip/knee/foot)
+  function limbPts(pts, r0, r1, n = 7) {
+    const path = [];
+    for (let s = 0; s < pts.length - 1; s++)
+      for (let i = 0; i < n; i++) { const u = i / n; path.push(add(scl(pts[s], 1 - u), scl(pts[s + 1], u))); }
+    path.push(pts[pts.length - 1]);
+    const N = path.length, left = [], right = [];
+    for (let i = 0; i < N; i++) {
+      const a = path[Math.max(0, i - 1)], b = path[Math.min(N - 1, i + 1)];
+      const d = Math.hypot(b.x - a.x, b.y - a.y) || 1, nx = -(b.y - a.y) / d, ny = (b.x - a.x) / d;
+      const r = lerp(r0, r1, i / (N - 1));
+      left.push({ x: path[i].x + nx * r, y: path[i].y + ny * r });
+      right.push({ x: path[i].x - nx * r, y: path[i].y - ny * r });
+    }
+    const cap = (c, from, r, rev) => {
+      const out = [], a0 = Math.atan2(from.y - c.y, from.x - c.x);
+      for (let i = 1; i < 6; i++) { const t = a0 + (rev ? -1 : 1) * Math.PI * i / 6; out.push({ x: c.x + Math.cos(t) * r, y: c.y + Math.sin(t) * r }); }
+      return out;
+    };
+    return [...left, ...cap(path[N - 1], left[N - 1], r1, true), ...right.reverse(), ...cap(path[0], right[N - 1], r0, true)];
+  }
+  function tracePath(pts, closed, amp, seedOff = 0) {
+    const q = pts.map((p, i) => ({ x: p.x + jit(i * 2 + seedOff, amp), y: p.y + jit(i * 2 + 1 + seedOff, amp) }));
+    ctx.beginPath();
+    if (!closed) {
+      ctx.moveTo(q[0].x, q[0].y);
+      for (let i = 1; i < q.length - 1; i++) { const m = { x: (q[i].x + q[i + 1].x) / 2, y: (q[i].y + q[i + 1].y) / 2 }; ctx.quadraticCurveTo(q[i].x, q[i].y, m.x, m.y); }
+      ctx.lineTo(q[q.length - 1].x, q[q.length - 1].y);
+    } else {
+      const n = q.length, m0 = { x: (q[n - 1].x + q[0].x) / 2, y: (q[n - 1].y + q[0].y) / 2 };
+      ctx.moveTo(m0.x, m0.y);
+      for (let i = 0; i < n; i++) { const a = q[i], b = q[(i + 1) % n]; ctx.quadraticCurveTo(a.x, a.y, (a.x + b.x) / 2, (a.y + b.y) / 2); }
+      ctx.closePath();
+    }
+  }
+  function bbox(pts) {
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (const p of pts) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+    return { x0, y0, x1, y1 };
+  }
+
+  // ---------- drawing primitives that respect the style ----------
+  function fillShape(pts, key, hatchAngle = 0.7, density = 1) {
+    const S = STYLES[styleName], col = key && S.colors[key];
+    if (!col) return;
+    ctx.save();
+    ctx.globalCompositeOperation = S.blend;
+    if (S.fill === 'marker') {
+      // loose, slightly off-register marker fill
+      ctx.globalAlpha = 0.92;
+      ctx.fillStyle = col;
+      ctx.translate(3 + jit(900, 1.5), 2 + jit(901, 1.5));
+      tracePath(pts, true, 3, 50);
+      ctx.fill();
+      // a few darker streaks to read as marker
+      ctx.clip();
+      const b = bbox(pts);
+      ctx.strokeStyle = col; ctx.globalAlpha = 0.35; ctx.lineWidth = 9;
+      for (let y = b.y0; y < b.y1; y += 16) { ctx.beginPath(); ctx.moveTo(b.x0 - 10, y + jit(y, 3)); ctx.lineTo(b.x1 + 10, y + 10 + jit(y + 1, 3)); ctx.stroke(); }
+    } else {
+      tracePath(pts, true, 1.5, 70);
+      ctx.clip();
+      const b = bbox(pts), gap = S.hatchGap / density;
+      ctx.strokeStyle = col; ctx.lineCap = 'round';
+      ctx.globalAlpha = styleName === 'chalk' ? 0.55 : 0.75;
+      ctx.lineWidth = styleName === 'chalk' ? 2.2 : 1.4;
+      const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, R = Math.hypot(b.x1 - b.x0, b.y1 - b.y0) / 2 + 10;
+      const dir = { x: Math.cos(hatchAngle), y: Math.sin(hatchAngle) }, nrm = { x: -dir.y, y: dir.x };
+      let k = 0;
+      for (let d = -R; d <= R; d += gap, k++) {
+        const o = { x: cx + nrm.x * d, y: cy + nrm.y * d };
+        ctx.beginPath();
+        ctx.moveTo(o.x - dir.x * R + jit(k * 5, 2), o.y - dir.y * R + jit(k * 5 + 1, 2));
+        ctx.lineTo(o.x + dir.x * R + jit(k * 5 + 2, 2), o.y + dir.y * R + jit(k * 5 + 3, 2));
+        ctx.stroke();
+      }
+      if (key === 'black' || key === 'red' && styleName === 'pencil') {
+        // cross-hatch for darker values
+        ctx.globalAlpha *= key === 'black' ? 1 : 0.45;
+        const d2 = { x: Math.cos(hatchAngle + 1.3), y: Math.sin(hatchAngle + 1.3) }, n2 = { x: -d2.y, y: d2.x };
+        for (let d = -R; d <= R; d += gap * 1.4, k++) {
+          const o = { x: cx + n2.x * d, y: cy + n2.y * d };
+          ctx.beginPath(); ctx.moveTo(o.x - d2.x * R, o.y - d2.y * R); ctx.lineTo(o.x + d2.x * R, o.y + d2.y * R); ctx.stroke();
+        }
+      }
+    }
+    ctx.restore();
+  }
+  function outline(pts, closed = true, wMul = 1) {
+    const S = STYLES[styleName];
+    ctx.save();
+    ctx.strokeStyle = S.line; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (let p = 0; p < S.passes; p++) {
+      ctx.globalAlpha = S.lineAlpha * (p === 0 ? 1 : 0.45);
+      ctx.lineWidth = S.lineW * wMul * (p === 0 ? 1 : 0.6);
+      if (styleName === 'chalk') ctx.setLineDash([14 + jit(800 + p, 6), 2.5 + Math.abs(jit(810 + p, 2))]);
+      tracePath(pts, closed, S.jitter * (p === 0 ? 1 : 1.8), p * 300);
+      ctx.stroke();
+    }
+    if (styleName === 'ink') { // thin ghost line like a pencil under-drawing
+      ctx.globalAlpha = 0.25; ctx.lineWidth = 0.8; tracePath(pts, closed, 3.5, 600); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function shape(pts, key, hatchAngle, wMul) { strokeId++; fillShape(pts, key, hatchAngle); outline(pts, true, wMul); }
+  function line(pts, wMul = 1) { strokeId++; outline(pts, false, wMul); }
+  function dot(x, y, r, key = 'black') {
+    strokeId++;
+    const S = STYLES[styleName];
+    ctx.save(); ctx.fillStyle = S.colors[key] || S.line; ctx.globalAlpha = S.lineAlpha;
+    tracePath(ellipsePts(x, y, r, r, 0, 8), true, 0.4); ctx.fill(); ctx.restore();
+  }
+
+  // ---------- dance choreography (all in beats) ----------
+  function poseAt(t) {
+    const moveLen = 8, n = 4;
+    t = ((t % (moveLen * n)) + moveLen * n) % (moveLen * n); // wrap (also handles negative lag times)
+    const m = Math.floor(t / moveLen), next = (m + 1) % n;
+    const into = t - m * moveLen;
+    const a = MOVES[m](t);
+    if (into < moveLen - 0.75) return a;
+    const b = MOVES[next](t), x = smooth(clamp01((into - (moveLen - 0.75)) / 0.75));
+    const out = {};
+    for (const k in a) out[k] = Array.isArray(a[k]) ? a[k].map((v, i) => lerp(v, b[k][i], x)) : lerp(a[k], b[k], x);
+    return out;
+  }
+  const down = t => Math.pow(Math.abs(Math.cos(Math.PI * t)), 2); // 1 on every beat
+  const MOVES = [
+    // 1. side-step groove with pumping elbows
+    t => {
+      const d = down(t), s = Math.sin(Math.PI * t), sway = Math.sin(Math.PI * t / 2);
+      return {
+        hipX: 24 * sway, lean: -0.07 * sway, head: 0.14 * s, lift: 0,
+        armR: [0.55 + 0.3 * s, -1.7 + 0.35 * s], armL: [0.55 - 0.3 * s, -1.7 - 0.35 * s],
+        legR: [0.14 + 0.3 * d, -0.55 * d], legL: [0.14 + 0.3 * d, -0.55 * d], squash: d,
+      };
+    },
+    // 2. disco point: up to the sky, down across the body
+    t => {
+      const x = smooth(smooth(0.5 - 0.5 * Math.cos(Math.PI * t))), d = down(t);
+      return {
+        hipX: lerp(-16, 16, x), lean: lerp(-0.13, 0.1, x), head: lerp(-0.18, 0.12, x), lift: 0,
+        armR: [lerp(2.55, -0.25, x), lerp(0.05, -0.45, x)], armL: [0.75, -2.05],
+        legR: [0.2 + 0.18 * x, -0.4 * x], legL: [0.1 + 0.15 * d, -0.25 * d], squash: d * 0.6,
+      };
+    },
+    // 3. hands in the air, swaying together
+    t => {
+      const w = Math.sin(Math.PI * t), d = down(t);
+      return {
+        hipX: 18 * w, lean: -0.1 * w, head: -0.12 * w, lift: 0,
+        armR: [2.35 + 0.35 * w, 0.35 - 0.25 * w], armL: [2.35 - 0.35 * w, 0.35 + 0.25 * w],
+        legR: [0.16 + 0.22 * d, -0.4 * d], legL: [0.16 + 0.22 * d, -0.4 * d], squash: d,
+      };
+    },
+    // 4. folded-arm side kicks, alternating legs
+    t => {
+      const right = Math.floor(t) % 2 === 0, k = Math.sin(Math.PI * (t % 1)), d = down(t);
+      const kick = [0.2 + 1.05 * k, -0.25 * k], stand = [0.12 + 0.25 * d, -0.45 * d];
+      return {
+        hipX: (right ? -8 : 8) * k, lean: (right ? -0.08 : 0.08) * k, head: (right ? 0.1 : -0.1) * k, lift: 6 * k,
+        armR: [0.75, -2.35], armL: [0.75, -2.35],
+        legR: right ? kick : stand, legL: right ? stand : kick, squash: 1 - k,
+      };
+    },
+  ];
+
+  // ---------- Santa ----------
+  const THIGH = 58, SHIN = 54, UPPER = 52, FORE = 48;
+  const limbDir = (a, side) => ({ x: side * Math.sin(a), y: Math.cos(a) });
+
+  function drawSanta(tBeats) {
+    const P = poseAt(tBeats), Plag = poseAt(tBeats - 0.18), Pjig = poseAt(tBeats - 0.1);
+
+    // legs relative to hip; hip height comes from whichever foot is lowest
+    const legs = [[1, P.legR], [-1, P.legL]].map(([side, [th, sh]]) => {
+      const h = { x: side * 28, y: 0 };
+      const knee = add(h, scl(limbDir(th, side), THIGH));
+      const foot = add(knee, scl(limbDir(th + sh, side), SHIN));
+      return { side, h, knee, foot };
+    });
+    const hipH = Math.max(...legs.map(l => l.foot.y)) + 10 + P.lift;
+    const hip = { x: P.hipX, y: -hipH };
+    const W2 = p => add(hip, p);                       // hip-relative to world
+    const T = p => add(hip, rot(p, P.lean));           // torso frame to world
+
+    // ground shadow
+    strokeId++;
+    const shadow = ellipsePts(hip.x * 0.6, 4, 95 - P.lift, 11, 0, 18);
+    fillShape(shadow, 'shadow', 0.15, 0.7);
+
+    // legs + boots
+    for (const l of legs) {
+      const hp = W2(l.h), kp = W2(l.knee), fp = W2(l.foot);
+      shape(limbPts([hp, kp, fp], 18, 15), 'red', 0.9);
+      shape(capsulePts(add(fp, { x: -l.side * 2, y: 4 }), add(fp, { x: l.side * 26, y: 6 }), 13), 'black', 0.4);
+      line([add(fp, { x: -l.side * 14, y: -4 }), add(fp, { x: l.side * 14, y: -6 })], 0.8); // boot cuff
+    }
+
+    // body / coat with a little belly jiggle
+    const sq = Pjig.squash;
+    const bellyC = T({ x: 0, y: -62 + 3 * sq });
+    const belly = ellipsePts(bellyC.x, bellyC.y, 72 + 5 * sq, 74 - 5 * sq, P.lean, 26);
+    shape(belly, 'red', 0.7, 1.1);
+    // fur hem + centre trim
+    shape(capsulePts(T({ x: -62, y: -10 + 2 * sq }), T({ x: 62, y: -10 + 2 * sq }), 11), 'white', 0.2);
+    shape(capsulePts(T({ x: 0, y: -128 }), T({ x: 0, y: -18 }), 8), 'white', 1.4);
+    // belt + buckle
+    const beltY = -64 + 3 * sq;
+    shape([T({ x: -74, y: beltY - 9 }), T({ x: 74, y: beltY - 9 }), T({ x: 74, y: beltY + 9 }), T({ x: -74, y: beltY + 9 })], 'black', 0.3);
+    shape([T({ x: -14, y: beltY - 13 }), T({ x: 14, y: beltY - 13 }), T({ x: 14, y: beltY + 13 }), T({ x: -14, y: beltY + 13 })], 'gold', 0.8, 0.9);
+    line([T({ x: -6, y: beltY - 5 }), T({ x: 6, y: beltY - 5 }), T({ x: 6, y: beltY + 5 }), T({ x: -6, y: beltY + 5 }), T({ x: -6, y: beltY - 5 })], 0.7);
+
+    // head (drawn before arms so raised arms read in front)
+    const neck = T({ x: 0, y: -132 });
+    const H = (p) => add(neck, rot(p, P.lean + P.head));
+    const hc = H({ x: 0, y: -38 });
+    // beard behind face (scalloped cloud)
+    strokeId++;
+    const beard = [];
+    for (let i = 0; i < 28; i++) {
+      const a = (i / 28) * Math.PI * 2, bump = 1 + 0.09 * Math.sin(a * 9);
+      beard.push(H({ x: Math.cos(a) * 44 * bump, y: -18 + Math.sin(a) * 46 * bump + (Math.sin(a) > 0 ? 10 : 0) }));
+    }
+    shape(beard, 'white', 1.1);
+    const face = ellipsePts(hc.x, hc.y, 30, 31, P.lean + P.head, 18);
+    shape(face, 'skin', 0.5);
+    // happy closed eyes, cheeks, nose, mustache, brows
+    for (const s of [-1, 1]) {
+      line([H({ x: s * 16, y: -44 }), H({ x: s * 11, y: -49 }), H({ x: s * 5, y: -44 })], 0.9);
+      strokeId++; fillShape(ellipsePts(...Object.values(H({ x: s * 19, y: -33 })), 6, 4, 0, 10), 'red', 0.3, 1.6);
+      shape(ellipsePts(...Object.values(H({ x: s * 11, y: -21 })), 13, 7, P.lean + P.head + s * 0.25, 12), 'white', 0.3);
+      shape(ellipsePts(...Object.values(H({ x: s * 12, y: -56 })), 9, 4, P.lean + P.head - s * 0.15, 10), 'white', 0.3, 0.8);
+    }
+    shape(ellipsePts(...Object.values(H({ x: 0, y: -31 })), 7, 6, 0, 10), 'red', 0.4);
+    // open singing mouth peeking under the mustache, opens on the beat
+    const mo = 2 + 4 * down(tBeats);
+    shape(ellipsePts(...Object.values(H({ x: 0, y: -10 })), 6, mo, P.lean + P.head, 10), 'black', 0.3, 0.8);
+
+    // hat: fur band + floppy cone whose tip lags behind the dance
+    const flop = -1.6 * Plag.lean - 0.7 * Plag.head + 0.012 * (Plag.hipX - P.hipX) * 6;
+    const bandL = H({ x: -34, y: -62 }), bandR = H({ x: 34, y: -62 });
+    const tipLocal = add({ x: 0, y: -62 }, rot({ x: 52, y: -60 }, flop * 0.8));
+    const tip = H(add(tipLocal, { x: 10, y: 18 }));
+    const ctrl = H({ x: 6 + 14 * flop, y: -122 });
+    strokeId++;
+    const cone = [H({ x: -30, y: -64 })];
+    for (let i = 1; i <= 8; i++) { const u = i / 8; cone.push({ x: (1 - u) * (1 - u) * cone[0].x + 2 * (1 - u) * u * ctrl.x + u * u * tip.x, y: (1 - u) * (1 - u) * cone[0].y + 2 * (1 - u) * u * ctrl.y + u * u * tip.y }); }
+    cone.push(H({ x: 30, y: -66 }));
+    shape(cone, 'red', 0.6);
+    shape(capsulePts(bandL, bandR, 11), 'white', 0.2);
+    shape(ellipsePts(tip.x, tip.y, 13, 13, 0, 12), 'white', 0.9);
+
+    // arms (in front of body)
+    for (const [side, [u, f]] of [[1, P.armR], [-1, P.armL]]) {
+      const sh = T({ x: side * 52, y: -118 });
+      const elbow = add(sh, scl(rot(limbDir(u, side), P.lean), UPPER));
+      const hand = add(elbow, scl(rot(limbDir(u + f, side), P.lean), FORE));
+      shape(limbPts([sh, elbow, hand], 17, 14), 'red', 0.9);
+      const dirv = { x: (hand.x - elbow.x) / FORE, y: (hand.y - elbow.y) / FORE };
+      shape(capsulePts(add(hand, scl(dirv, -6)), add(hand, scl(dirv, 2)), 14), 'white', 0.2);
+      const mit = add(hand, scl(dirv, 15));
+      shape(ellipsePts(mit.x, mit.y, 12, 13, Math.atan2(dirv.y, dirv.x), 12), styleName === 'chalk' ? 'green' : 'black', 0.5);
+    }
+  }
+
+  // ---------- background ----------
+  function buildPaper() {
+    const S = STYLES[styleName];
+    paper = document.createElement('canvas');
+    paper.width = W * DPR; paper.height = H * DPR;
+    const p = paper.getContext('2d');
+    p.fillStyle = S.bg; p.fillRect(0, 0, paper.width, paper.height);
+    const n = Math.floor(paper.width * paper.height / 900);
+    p.fillStyle = S.grain;
+    for (let i = 0; i < n; i++) { const x = hash(i * 1.3) * paper.width, y = hash(i * 7.7 + 3) * paper.height, r = hash(i * 2.1) * 1.6 * DPR + 0.3; p.fillRect(x, y, r, r); }
+    if (styleName === 'chalk') { // old eraser smudges
+      for (let i = 0; i < 9; i++) {
+        const g = p.createRadialGradient(hash(i * 4.1) * paper.width, hash(i * 9.3) * paper.height, 0, hash(i * 4.1) * paper.width, hash(i * 9.3) * paper.height, (0.15 + hash(i) * 0.25) * paper.width);
+        g.addColorStop(0, 'rgba(255,255,255,0.05)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+        p.fillStyle = g; p.fillRect(0, 0, paper.width, paper.height);
+      }
+    }
+    const v = p.createRadialGradient(paper.width / 2, paper.height / 2, paper.height * 0.35, paper.width / 2, paper.height / 2, Math.hypot(paper.width, paper.height) * 0.6);
+    v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, S.vignette);
+    p.fillStyle = v; p.fillRect(0, 0, paper.width, paper.height);
+    document.body.style.background = S.bg;
+  }
+  function resize(w = innerWidth, h = innerHeight, dpr = devicePixelRatio || 1) {
+    W = w; H = h; DPR = Math.min(dpr, 2);
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    buildPaper();
+  }
+
+  function drawSnow(tSec, unit) {
+    const L = BEATS_PER_LOOP * 60 / bpm;
+    ctx.save(); ctx.fillStyle = STYLES[styleName].colors.white || STYLES[styleName].line; ctx.globalAlpha = 0.75;
+    for (let i = 0; i < 90; i++) {
+      const k = 1 + Math.floor(hash(i * 3.3) * 3), m = 1 + Math.floor(hash(i * 5.9) * 3);
+      const y = ((hash(i * 1.7) + k * tSec / L) % 1) * (H * 1.1) - H * 0.05;
+      const x = hash(i * 8.1) * W + 14 * Math.sin(2 * Math.PI * m * tSec / L + i);
+      const r = (1.2 + hash(i * 2.9) * 2.2) * unit;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---------- frame ----------
+  function render(tSec) {
+    const frame = Math.floor(tSec * FPS);
+    const tq = frame / FPS;                       // quantised to 12fps
+    boil = frame % 4; strokeId = 0;               // 4-drawing line boil
+    const tBeats = tq * bpm / 60;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(paper, 0, 0);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    const snow = snowOverride === null ? STYLES[styleName].snow : snowOverride;
+    const unit = Math.min(W, H) / 900;
+    if (snow) drawSnow(tq, unit * 1.6);
+
+    const s = Math.min(H * 0.8 / 360, W * 0.9 / 300);
+    ctx.save();
+    ctx.translate(W / 2, H * 0.9);
+    ctx.scale(s, s);
+    drawSanta(tBeats);
+    ctx.restore();
+  }
+
+  // ---------- run ----------
+  window.__santa = {
+    render, resize,
+    setStyle(n) { styleName = n; buildPaper(); },
+    loopSeconds: () => BEATS_PER_LOOP * 60 / bpm, FPS,
+  };
+  resize();
+  addEventListener('resize', () => resize());
+
+  if (!EXPORT) {
+    const start = performance.now();
+    let lastFrame = -1;
+    const tick = now => {
+      const t = (now - start) / 1000, f = Math.floor(t * FPS);
+      if (f !== lastFrame) { lastFrame = f; render(t); }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+
+    const help = document.getElementById('help'), label = document.getElementById('bpmlabel');
+    const showBpm = () => { label.textContent = `Style: ${styleName} · Tempo: ${Math.round(bpm)} BPM`; };
+    let taps = [];
+    addEventListener('keydown', e => {
+      const k = e.key.toLowerCase();
+      if (k === 'h' || k === '?') help.style.display = help.style.display === 'block' ? 'none' : 'block';
+      else if ('123'.includes(k)) { styleName = STYLE_NAMES[+k - 1]; buildPaper(); }
+      else if (k === '+' || k === '=') bpm = Math.min(200, bpm + 2);
+      else if (k === '-' || k === '_') bpm = Math.max(60, bpm - 2);
+      else if (k === 's') snowOverride = !(snowOverride === null ? STYLES[styleName].snow : snowOverride);
+      else if (k === 't') {
+        const now = performance.now(); taps = taps.filter(x => now - x < 3000); taps.push(now);
+        if (taps.length >= 4) bpm = Math.max(60, Math.min(200, 60000 / ((taps[taps.length - 1] - taps[0]) / (taps.length - 1))));
+      }
+      showBpm();
+    });
+    showBpm();
+  }
+})();
+</script>
+</body>
+</html>
